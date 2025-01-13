@@ -23,12 +23,12 @@
                     {{#if page_data.web_vault_enabled}}
                     <dt class="col-sm-5">Web Installed
                         <span class="badge bg-success d-none" id="web-success" title="Latest version is installed.">Ok</span>
-                        <span class="badge bg-warning d-none" id="web-warning" title="There seems to be an update available.">Update</span>
+                        <span class="badge bg-warning text-dark d-none" id="web-warning" title="There seems to be an update available.">Update</span>
                     </dt>
                     <dd class="col-sm-7">
                         <span id="web-installed">{{page_data.web_vault_version}}</span>
                     </dd>
-                    {{#unless page_data.running_within_docker}}
+                    {{#unless page_data.running_within_container}}
                     <dt class="col-sm-5">Web Latest
                         <span class="badge bg-secondary d-none" id="web-failed" title="Unable to determine latest version.">Unknown</span>
                     </dt>
@@ -59,12 +59,12 @@
                     <dd class="col-sm-7">
                         <span class="d-block"><b>{{ page_data.host_os }} / {{ page_data.host_arch }}</b></span>
                     </dd>
-                    <dt class="col-sm-5">Running within Docker</dt>
+                    <dt class="col-sm-5">Running within a container</dt>
                     <dd class="col-sm-7">
-                    {{#if page_data.running_within_docker}}
-                        <span class="d-block"><b>Yes (Base: {{ page_data.docker_base_image }})</b></span>
+                    {{#if page_data.running_within_container}}
+                        <span class="d-block"><b>Yes (Base: {{ page_data.container_base_image }})</b></span>
                     {{/if}}
-                    {{#unless page_data.running_within_docker}}
+                    {{#unless page_data.running_within_container}}
                         <span class="d-block"><b>No</b></span>
                     {{/unless}}
                     </dd>
@@ -132,6 +132,21 @@
                         <span class="d-block" title="We have direct internet access, no outgoing proxy configured."><b>No</b></span>
                     {{/unless}}
                     </dd>
+                    <dt class="col-sm-5">Websocket enabled
+                        {{#if page_data.enable_websocket}}
+                        <span class="badge bg-success d-none" id="websocket-success" title="Websocket connection is working.">Ok</span>
+                        <span class="badge bg-danger d-none" id="websocket-error" title="Websocket connection error, validate your reverse proxy configuration!">Error</span>
+                        {{/if}}
+                    </dt>
+                    <dd class="col-sm-7">
+                    {{#if page_data.enable_websocket}}
+                        <span class="d-block" title="Websocket connections are enabled (ENABLE_WEBSOCKET is true)."><b>Yes</b></span>
+                    {{/if}}
+                    {{#unless page_data.enable_websocket}}
+                        <span class="d-block" title="Websocket connections are disabled (ENABLE_WEBSOCKET is false)."><b>No</b></span>
+                    {{/unless}}
+                    </dd>
+
                     <dt class="col-sm-5">DNS (github.com)
                         <span class="badge bg-success d-none" id="dns-success" title="DNS Resolving works!">Ok</span>
                         <span class="badge bg-danger d-none" id="dns-warning" title="DNS Resolving failed. Please fix.">Error</span>
@@ -166,6 +181,14 @@
                     <dd class="col-sm-7">
                         <span id="domain-server" class="d-block"><b>Server:</b> <span id="domain-server-string">{{page_data.admin_url}}</span></span>
                         <span id="domain-browser" class="d-block"><b>Browser:</b> <span id="domain-browser-string"></span></span>
+                    </dd>
+
+                    <dt class="col-sm-5">HTTP Response validation
+                        <span class="badge bg-success d-none" id="http-response-success" title="All headers and HTTP request responses seem to be ok.">Ok</span>
+                        <span class="badge bg-danger d-none" id="http-response-warning" title="Some headers or HTTP request responses return invalid data!">Error</span>
+                    </dt>
+                    <dd class="col-sm-7">
+                        <span id="http-response-errors" class="d-block"></span>
                     </dd>
                 </dl>
             </div>

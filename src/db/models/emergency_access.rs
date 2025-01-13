@@ -1,9 +1,10 @@
 use chrono::{NaiveDateTime, Utc};
+use derive_more::{AsRef, Deref, Display, From};
 use serde_json::Value;
 
+use super::{User, UserId};
 use crate::{api::EmptyResult, db::DbConn, error::MapResult};
-
-use super::User;
+use macros::UuidFromParam;
 
 db_object! {
     #[derive(Identifiable, Queryable, Insertable, AsChangeset)]
@@ -11,9 +12,9 @@ db_object! {
     #[diesel(treat_none_as_null = true)]
     #[diesel(primary_key(uuid))]
     pub struct EmergencyAccess {
-        pub uuid: String,
-        pub grantor_uuid: String,
-        pub grantee_uuid: Option<String>,
+        pub uuid: EmergencyAccessId,
+        pub grantor_uuid: UserId,
+        pub grantee_uuid: Option<UserId>,
         pub email: Option<String>,
         pub key_encrypted: Option<String>,
         pub atype: i32, //EmergencyAccessType
@@ -26,14 +27,14 @@ db_object! {
     }
 }
 
-/// Local methods
+// Local methods
 
 impl EmergencyAccess {
-    pub fn new(grantor_uuid: String, email: String, status: i32, atype: i32, wait_time_days: i32) -> Self {
+    pub fn new(grantor_uuid: UserId, email: String, status: i32, atype: i32, wait_time_days: i32) -> Self {
         let now = Utc::now().naive_utc();
 
         Self {
-            uuid: crate::util::get_uuid(),
+            uuid: EmergencyAccessId(crate::util::get_uuid()),
             grantor_uuid,
             grantee_uuid: None,
             email: Some(email),
@@ -58,11 +59,11 @@ impl EmergencyAccess {
 
     pub fn to_json(&self) -> Value {
         json!({
-            "Id": self.uuid,
-            "Status": self.status,
-            "Type": self.atype,
-            "WaitTimeDays": self.wait_time_days,
-            "Object": "emergencyAccess",
+            "id": self.uuid,
+            "status": self.status,
+            "type": self.atype,
+            "waitTimeDays": self.wait_time_days,
+            "object": "emergencyAccess",
         })
     }
 
@@ -70,36 +71,43 @@ impl EmergencyAccess {
         let grantor_user = User::find_by_uuid(&self.grantor_uuid, conn).await.expect("Grantor user not found.");
 
         json!({
-            "Id": self.uuid,
-            "Status": self.status,
-            "Type": self.atype,
-            "WaitTimeDays": self.wait_time_days,
-            "GrantorId": grantor_user.uuid,
-            "Email": grantor_user.email,
-            "Name": grantor_user.name,
-            "Object": "emergencyAccessGrantorDetails",
+            "id": self.uuid,
+            "status": self.status,
+            "type": self.atype,
+            "waitTimeDays": self.wait_time_days,
+            "grantorId": grantor_user.uuid,
+            "email": grantor_user.email,
+            "name": grantor_user.name,
+            "object": "emergencyAccessGrantorDetails",
         })
     }
 
-    pub async fn to_json_grantee_details(&self, conn: &mut DbConn) -> Value {
-        let grantee_user = if let Some(grantee_uuid) = self.grantee_uuid.as_deref() {
-            Some(User::find_by_uuid(grantee_uuid, conn).await.expect("Grantee user not found."))
+    pub async fn to_json_grantee_details(&self, conn: &mut DbConn) -> Option<Value> {
+        let grantee_user = if let Some(grantee_uuid) = &self.grantee_uuid {
+            User::find_by_uuid(grantee_uuid, conn).await.expect("Grantee user not found.")
         } else if let Some(email) = self.email.as_deref() {
-            Some(User::find_by_mail(email, conn).await.expect("Grantee user not found."))
+            match User::find_by_mail(email, conn).await {
+                Some(user) => user,
+                None => {
+                    // remove outstanding invitations which should not exist
+                    Self::delete_all_by_grantee_email(email, conn).await.ok();
+                    return None;
+                }
+            }
         } else {
-            None
+            return None;
         };
 
-        json!({
-            "Id": self.uuid,
-            "Status": self.status,
-            "Type": self.atype,
-            "WaitTimeDays": self.wait_time_days,
-            "GranteeId": grantee_user.as_ref().map_or("", |u| &u.uuid),
-            "Email": grantee_user.as_ref().map_or("", |u| &u.email),
-            "Name": grantee_user.as_ref().map_or("", |u| &u.name),
-            "Object": "emergencyAccessGranteeDetails",
-        })
+        Some(json!({
+            "id": self.uuid,
+            "status": self.status,
+            "type": self.atype,
+            "waitTimeDays": self.wait_time_days,
+            "granteeId": grantee_user.uuid,
+            "email": grantee_user.email,
+            "name": grantee_user.name,
+            "object": "emergencyAccessGranteeDetails",
+        }))
     }
 }
 
@@ -174,7 +182,7 @@ impl EmergencyAccess {
         // Update the grantee so that it will refresh it's status.
         User::update_uuid_revision(self.grantee_uuid.as_ref().expect("Error getting grantee"), conn).await;
         self.status = status;
-        self.updated_at = date.to_owned();
+        date.clone_into(&mut self.updated_at);
 
         db_run! {conn: {
             crate::util::retry(|| {
@@ -192,7 +200,7 @@ impl EmergencyAccess {
         conn: &mut DbConn,
     ) -> EmptyResult {
         self.last_notification_at = Some(date.to_owned());
-        self.updated_at = date.to_owned();
+        date.clone_into(&mut self.updated_at);
 
         db_run! {conn: {
             crate::util::retry(|| {
@@ -204,11 +212,18 @@ impl EmergencyAccess {
         }}
     }
 
-    pub async fn delete_all_by_user(user_uuid: &str, conn: &mut DbConn) -> EmptyResult {
+    pub async fn delete_all_by_user(user_uuid: &UserId, conn: &mut DbConn) -> EmptyResult {
         for ea in Self::find_all_by_grantor_uuid(user_uuid, conn).await {
             ea.delete(conn).await?;
         }
         for ea in Self::find_all_by_grantee_uuid(user_uuid, conn).await {
+            ea.delete(conn).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn delete_all_by_grantee_email(grantee_email: &str, conn: &mut DbConn) -> EmptyResult {
+        for ea in Self::find_all_invited_by_grantee_email(grantee_email, conn).await {
             ea.delete(conn).await?;
         }
         Ok(())
@@ -224,18 +239,9 @@ impl EmergencyAccess {
         }}
     }
 
-    pub async fn find_by_uuid(uuid: &str, conn: &mut DbConn) -> Option<Self> {
-        db_run! { conn: {
-            emergency_access::table
-                .filter(emergency_access::uuid.eq(uuid))
-                .first::<EmergencyAccessDb>(conn)
-                .ok().from_db()
-        }}
-    }
-
     pub async fn find_by_grantor_uuid_and_grantee_uuid_or_email(
-        grantor_uuid: &str,
-        grantee_uuid: &str,
+        grantor_uuid: &UserId,
+        grantee_uuid: &UserId,
         email: &str,
         conn: &mut DbConn,
     ) -> Option<Self> {
@@ -257,7 +263,11 @@ impl EmergencyAccess {
         }}
     }
 
-    pub async fn find_by_uuid_and_grantor_uuid(uuid: &str, grantor_uuid: &str, conn: &mut DbConn) -> Option<Self> {
+    pub async fn find_by_uuid_and_grantor_uuid(
+        uuid: &EmergencyAccessId,
+        grantor_uuid: &UserId,
+        conn: &mut DbConn,
+    ) -> Option<Self> {
         db_run! { conn: {
             emergency_access::table
                 .filter(emergency_access::uuid.eq(uuid))
@@ -267,7 +277,35 @@ impl EmergencyAccess {
         }}
     }
 
-    pub async fn find_all_by_grantee_uuid(grantee_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
+    pub async fn find_by_uuid_and_grantee_uuid(
+        uuid: &EmergencyAccessId,
+        grantee_uuid: &UserId,
+        conn: &mut DbConn,
+    ) -> Option<Self> {
+        db_run! { conn: {
+            emergency_access::table
+                .filter(emergency_access::uuid.eq(uuid))
+                .filter(emergency_access::grantee_uuid.eq(grantee_uuid))
+                .first::<EmergencyAccessDb>(conn)
+                .ok().from_db()
+        }}
+    }
+
+    pub async fn find_by_uuid_and_grantee_email(
+        uuid: &EmergencyAccessId,
+        grantee_email: &str,
+        conn: &mut DbConn,
+    ) -> Option<Self> {
+        db_run! { conn: {
+            emergency_access::table
+                .filter(emergency_access::uuid.eq(uuid))
+                .filter(emergency_access::email.eq(grantee_email))
+                .first::<EmergencyAccessDb>(conn)
+                .ok().from_db()
+        }}
+    }
+
+    pub async fn find_all_by_grantee_uuid(grantee_uuid: &UserId, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             emergency_access::table
                 .filter(emergency_access::grantee_uuid.eq(grantee_uuid))
@@ -285,13 +323,60 @@ impl EmergencyAccess {
         }}
     }
 
-    pub async fn find_all_by_grantor_uuid(grantor_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
+    pub async fn find_all_invited_by_grantee_email(grantee_email: &str, conn: &mut DbConn) -> Vec<Self> {
+        db_run! { conn: {
+            emergency_access::table
+                .filter(emergency_access::email.eq(grantee_email))
+                .filter(emergency_access::status.eq(EmergencyAccessStatus::Invited as i32))
+                .load::<EmergencyAccessDb>(conn).expect("Error loading emergency_access").from_db()
+        }}
+    }
+
+    pub async fn find_all_by_grantor_uuid(grantor_uuid: &UserId, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             emergency_access::table
                 .filter(emergency_access::grantor_uuid.eq(grantor_uuid))
                 .load::<EmergencyAccessDb>(conn).expect("Error loading emergency_access").from_db()
         }}
     }
+
+    pub async fn accept_invite(
+        &mut self,
+        grantee_uuid: &UserId,
+        grantee_email: &str,
+        conn: &mut DbConn,
+    ) -> EmptyResult {
+        if self.email.is_none() || self.email.as_ref().unwrap() != grantee_email {
+            err!("User email does not match invite.");
+        }
+
+        if self.status == EmergencyAccessStatus::Accepted as i32 {
+            err!("Emergency contact already accepted.");
+        }
+
+        self.status = EmergencyAccessStatus::Accepted as i32;
+        self.grantee_uuid = Some(grantee_uuid.clone());
+        self.email = None;
+        self.save(conn).await
+    }
 }
 
 // endregion
+
+#[derive(
+    Clone,
+    Debug,
+    AsRef,
+    Deref,
+    DieselNewType,
+    Display,
+    From,
+    FromForm,
+    Hash,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    UuidFromParam,
+)]
+pub struct EmergencyAccessId(String);

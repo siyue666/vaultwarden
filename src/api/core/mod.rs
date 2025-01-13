@@ -12,13 +12,13 @@ pub use accounts::purge_auth_requests;
 pub use ciphers::{purge_trashed_ciphers, CipherData, CipherSyncData, CipherSyncType};
 pub use emergency_access::{emergency_notification_reminder_job, emergency_request_timeout_job};
 pub use events::{event_cleanup_job, log_event, log_user_event};
+use reqwest::Method;
 pub use sends::purge_sends;
-pub use two_factor::send_incomplete_2fa_notifications;
 
 pub fn routes() -> Vec<Route> {
     let mut eq_domains_routes = routes![get_eq_domains, post_eq_domains, put_eq_domains];
     let mut hibp_routes = routes![hibp_breach];
-    let mut meta_routes = routes![alive, now, version, config];
+    let mut meta_routes = routes![alive, now, version, config, get_api_webauthn];
 
     let mut routes = Vec::new();
     routes.append(&mut accounts::routes());
@@ -47,23 +47,23 @@ pub fn events_routes() -> Vec<Route> {
 //
 // Move this somewhere else
 //
-use rocket::{serde::json::Json, Catcher, Route};
-use serde_json::Value;
+use rocket::{serde::json::Json, serde::json::Value, Catcher, Route};
 
 use crate::{
-    api::{JsonResult, JsonUpcase, Notify, UpdateType},
+    api::{JsonResult, Notify, UpdateType},
     auth::Headers,
     db::DbConn,
     error::Error,
-    util::get_reqwest_client,
+    http_client::make_http_request,
+    util::parse_experimental_client_feature_flags,
 };
 
-#[derive(Serialize, Deserialize, Debug)]
-#[allow(non_snake_case)]
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GlobalDomain {
-    Type: i32,
-    Domains: Vec<String>,
-    Excluded: bool,
+    r#type: i32,
+    domains: Vec<String>,
+    excluded: bool,
 }
 
 const GLOBAL_DOMAINS: &str = include_str!("../../static/global_domains.json");
@@ -83,38 +83,38 @@ fn _get_eq_domains(headers: Headers, no_excluded: bool) -> Json<Value> {
     let mut globals: Vec<GlobalDomain> = from_str(GLOBAL_DOMAINS).unwrap();
 
     for global in &mut globals {
-        global.Excluded = excluded_globals.contains(&global.Type);
+        global.excluded = excluded_globals.contains(&global.r#type);
     }
 
     if no_excluded {
-        globals.retain(|g| !g.Excluded);
+        globals.retain(|g| !g.excluded);
     }
 
     Json(json!({
-        "EquivalentDomains": equivalent_domains,
-        "GlobalEquivalentDomains": globals,
-        "Object": "domains",
+        "equivalentDomains": equivalent_domains,
+        "globalEquivalentDomains": globals,
+        "object": "domains",
     }))
 }
 
-#[derive(Deserialize, Debug)]
-#[allow(non_snake_case)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EquivDomainData {
-    ExcludedGlobalEquivalentDomains: Option<Vec<i32>>,
-    EquivalentDomains: Option<Vec<Vec<String>>>,
+    excluded_global_equivalent_domains: Option<Vec<i32>>,
+    equivalent_domains: Option<Vec<Vec<String>>>,
 }
 
 #[post("/settings/domains", data = "<data>")]
 async fn post_eq_domains(
-    data: JsonUpcase<EquivDomainData>,
+    data: Json<EquivDomainData>,
     headers: Headers,
     mut conn: DbConn,
     nt: Notify<'_>,
 ) -> JsonResult {
-    let data: EquivDomainData = data.into_inner().data;
+    let data: EquivDomainData = data.into_inner();
 
-    let excluded_globals = data.ExcludedGlobalEquivalentDomains.unwrap_or_default();
-    let equivalent_domains = data.EquivalentDomains.unwrap_or_default();
+    let excluded_globals = data.excluded_global_equivalent_domains.unwrap_or_default();
+    let equivalent_domains = data.equivalent_domains.unwrap_or_default();
 
     let mut user = headers.user;
     use serde_json::to_string;
@@ -130,25 +130,19 @@ async fn post_eq_domains(
 }
 
 #[put("/settings/domains", data = "<data>")]
-async fn put_eq_domains(
-    data: JsonUpcase<EquivDomainData>,
-    headers: Headers,
-    conn: DbConn,
-    nt: Notify<'_>,
-) -> JsonResult {
+async fn put_eq_domains(data: Json<EquivDomainData>, headers: Headers, conn: DbConn, nt: Notify<'_>) -> JsonResult {
     post_eq_domains(data, headers, conn, nt).await
 }
 
 #[get("/hibp/breach?<username>")]
-async fn hibp_breach(username: &str) -> JsonResult {
-    let url = format!(
-        "https://haveibeenpwned.com/api/v3/breachedaccount/{username}?truncateResponse=false&includeUnverified=false"
-    );
-
+async fn hibp_breach(username: &str, _headers: Headers) -> JsonResult {
+    let username: String = url::form_urlencoded::byte_serialize(username.as_bytes()).collect();
     if let Some(api_key) = crate::CONFIG.hibp_api_key() {
-        let hibp_client = get_reqwest_client();
+        let url = format!(
+            "https://haveibeenpwned.com/api/v3/breachedaccount/{username}?truncateResponse=false&includeUnverified=false"
+        );
 
-        let res = hibp_client.get(&url).header("hibp-api-key", api_key).send().await?;
+        let res = make_http_request(Method::GET, &url)?.header("hibp-api-key", api_key).send().await?;
 
         // If we get a 404, return a 404, it means no breached accounts
         if res.status() == 404 {
@@ -159,15 +153,15 @@ async fn hibp_breach(username: &str) -> JsonResult {
         Ok(Json(value))
     } else {
         Ok(Json(json!([{
-            "Name": "HaveIBeenPwned",
-            "Title": "Manual HIBP Check",
-            "Domain": "haveibeenpwned.com",
-            "BreachDate": "2019-08-18T00:00:00Z",
-            "AddedDate": "2019-08-18T00:00:00Z",
-            "Description": format!("Go to: <a href=\"https://haveibeenpwned.com/account/{username}\" target=\"_blank\" rel=\"noreferrer\">https://haveibeenpwned.com/account/{username}</a> for a manual check.<br/><br/>HaveIBeenPwned API key not set!<br/>Go to <a href=\"https://haveibeenpwned.com/API/Key\" target=\"_blank\" rel=\"noreferrer\">https://haveibeenpwned.com/API/Key</a> to purchase an API key from HaveIBeenPwned.<br/><br/>"),
-            "LogoPath": "vw_static/hibp.png",
-            "PwnCount": 0,
-            "DataClasses": [
+            "name": "HaveIBeenPwned",
+            "title": "Manual HIBP Check",
+            "domain": "haveibeenpwned.com",
+            "breachDate": "2019-08-18T00:00:00Z",
+            "addedDate": "2019-08-18T00:00:00Z",
+            "description": format!("Go to: <a href=\"https://haveibeenpwned.com/account/{username}\" target=\"_blank\" rel=\"noreferrer\">https://haveibeenpwned.com/account/{username}</a> for a manual check.<br/><br/>HaveIBeenPwned API key not set!<br/>Go to <a href=\"https://haveibeenpwned.com/API/Key\" target=\"_blank\" rel=\"noreferrer\">https://haveibeenpwned.com/API/Key</a> to purchase an API key from HaveIBeenPwned.<br/><br/>"),
+            "logoPath": "vw_static/hibp.png",
+            "pwnCount": 0,
+            "dataClasses": [
                 "Error - No API key set!"
             ]
         }])))
@@ -190,21 +184,41 @@ fn version() -> Json<&'static str> {
     Json(crate::VERSION.unwrap_or_default())
 }
 
+#[get("/webauthn")]
+fn get_api_webauthn(_headers: Headers) -> Json<Value> {
+    // Prevent a 404 error, which also causes key-rotation issues
+    // It looks like this is used when login with passkeys is enabled, which Vaultwarden does not (yet) support
+    // An empty list/data also works fine
+    Json(json!({
+        "object": "list",
+        "data": [],
+        "continuationToken": null
+    }))
+}
+
 #[get("/config")]
 fn config() -> Json<Value> {
     let domain = crate::CONFIG.domain();
+    let mut feature_states =
+        parse_experimental_client_feature_flags(&crate::CONFIG.experimental_client_feature_flags());
+    // Force the new key rotation feature
+    feature_states.insert("key-rotation-improvements".to_string(), true);
+    feature_states.insert("flexible-collections-v-1".to_string(), false);
+
     Json(json!({
         // Note: The clients use this version to handle backwards compatibility concerns
         // This means they expect a version that closely matches the Bitwarden server version
         // We should make sure that we keep this updated when we support the new server features
         // Version history:
         // - Individual cipher key encryption: 2023.9.1
-        "version": "2023.9.1",
+        "version": "2024.2.0",
         "gitHash": option_env!("GIT_REV"),
         "server": {
           "name": "Vaultwarden",
-          "url": "https://github.com/dani-garcia/vaultwarden",
-          "version": crate::VERSION
+          "url": "https://github.com/dani-garcia/vaultwarden"
+        },
+        "settings": {
+            "disableUserRegistration": !crate::CONFIG.signups_allowed() && crate::CONFIG.signups_domains_whitelist().is_empty(),
         },
         "environment": {
           "vault": domain,
@@ -213,13 +227,7 @@ fn config() -> Json<Value> {
           "notifications": format!("{domain}/notifications"),
           "sso": "",
         },
-        "featureStates": {
-          // Any feature flags that we want the clients to use
-          // Can check the enabled ones at:
-          // https://vault.bitwarden.com/api/config
-          "fido2-vault-credentials": true,  // Passkey support
-          "autofill-v2": false,             // Disabled because it is causing issues https://github.com/dani-garcia/vaultwarden/discussions/4052
-        },
+        "featureStates": feature_states,
         "object": "config",
     }))
 }

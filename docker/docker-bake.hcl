@@ -17,7 +17,7 @@ variable "SOURCE_REPOSITORY_URL" {
   default = null
 }
 
-// The commit hash of of the current commit this build was triggered on
+// The commit hash of the current commit this build was triggered on
 variable "SOURCE_COMMIT" {
   default = null
 }
@@ -124,6 +124,40 @@ target "debian-armv6" {
   platforms = ["linux/arm/v6"]
   tags = generate_tags("", "-armv6")
 }
+
+// ==== Start of unsupported Debian architecture targets ===
+// These are provided just to help users build for these rare platforms
+// They will not be built by default
+target "debian-386" {
+  inherits = ["debian"]
+  platforms = ["linux/386"]
+  tags = generate_tags("", "-386")
+  args = {
+    ARCH_OPENSSL_LIB_DIR = "/usr/lib/i386-linux-gnu"
+    ARCH_OPENSSL_INCLUDE_DIR = "/usr/include/i386-linux-gnu"
+  }
+}
+
+target "debian-ppc64le" {
+  inherits = ["debian"]
+  platforms = ["linux/ppc64le"]
+  tags = generate_tags("", "-ppc64le")
+  args = {
+    ARCH_OPENSSL_LIB_DIR = "/usr/lib/powerpc64le-linux-gnu"
+    ARCH_OPENSSL_INCLUDE_DIR = "/usr/include/powerpc64le-linux-gnu"
+  }
+}
+
+target "debian-s390x" {
+  inherits = ["debian"]
+  platforms = ["linux/s390x"]
+  tags = generate_tags("", "-s390x")
+  args = {
+    ARCH_OPENSSL_LIB_DIR = "/usr/lib/s390x-linux-gnu"
+    ARCH_OPENSSL_INCLUDE_DIR = "/usr/include/s390x-linux-gnu"
+  }
+}
+// ==== End of unsupported Debian architecture targets ===
 
 // A Group to build all platforms individually for local testing
 group "debian-all" {

@@ -1,11 +1,15 @@
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::{
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
+    Method,
+};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::{
     api::{ApiResult, EmptyResult, UpdateType},
-    db::models::{Cipher, Device, Folder, Send, User},
-    util::get_reqwest_client,
+    db::models::{AuthRequestId, Cipher, Device, DeviceId, Folder, Send, User, UserId},
+    http_client::make_http_request,
+    util::format_date,
     CONFIG,
 };
 
@@ -50,7 +54,10 @@ async fn get_auth_push_token() -> ApiResult<String> {
         ("client_secret", &client_secret),
     ];
 
-    let res = match get_reqwest_client().post("https://identity.bitwarden.com/connect/token").form(&params).send().await
+    let res = match make_http_request(Method::POST, &format!("{}/connect/token", CONFIG.push_identity_uri()))?
+        .form(&params)
+        .send()
+        .await
     {
         Ok(r) => r,
         Err(e) => err!(format!("Error getting push token from bitwarden server: {e}")),
@@ -72,45 +79,62 @@ async fn get_auth_push_token() -> ApiResult<String> {
     Ok(push_token.access_token.clone())
 }
 
-pub async fn register_push_device(user_uuid: String, device: Device) -> EmptyResult {
-    if !CONFIG.push_enabled() {
+pub async fn register_push_device(device: &mut Device, conn: &mut crate::db::DbConn) -> EmptyResult {
+    if !CONFIG.push_enabled() || !device.is_push_device() || device.is_registered() {
         return Ok(());
     }
-    let auth_push_token = get_auth_push_token().await?;
+
+    if device.push_token.is_none() {
+        warn!("Skipping the registration of the device {} because the push_token field is empty.", device.uuid);
+        warn!("To get rid of this message you need to clear the app data and reconnect the device.");
+        return Ok(());
+    }
+
+    debug!("Registering Device {}", device.uuid);
+
+    // generate a random push_uuid so we know the device is registered
+    device.push_uuid = Some(uuid::Uuid::new_v4().to_string());
 
     //Needed to register a device for push to bitwarden :
     let data = json!({
-        "userId": user_uuid,
+        "userId": device.user_uuid,
         "deviceId": device.push_uuid,
         "identifier": device.uuid,
         "type": device.atype,
         "pushToken": device.push_token
     });
 
+    let auth_push_token = get_auth_push_token().await?;
     let auth_header = format!("Bearer {}", &auth_push_token);
 
-    get_reqwest_client()
-        .post(CONFIG.push_relay_uri() + "/push/register")
+    if let Err(e) = make_http_request(Method::POST, &(CONFIG.push_relay_uri() + "/push/register"))?
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "application/json")
         .header(AUTHORIZATION, auth_header)
         .json(&data)
         .send()
         .await?
-        .error_for_status()?;
+        .error_for_status()
+    {
+        err!(format!("An error occurred while proceeding registration of a device: {e}"));
+    }
+
+    if let Err(e) = device.save(conn).await {
+        err!(format!("An error occurred while trying to save the (registered) device push uuid: {e}"));
+    }
+
     Ok(())
 }
 
-pub async fn unregister_push_device(uuid: String) -> EmptyResult {
-    if !CONFIG.push_enabled() {
+pub async fn unregister_push_device(push_id: Option<String>) -> EmptyResult {
+    if !CONFIG.push_enabled() || push_id.is_none() {
         return Ok(());
     }
     let auth_push_token = get_auth_push_token().await?;
 
     let auth_header = format!("Bearer {}", &auth_push_token);
 
-    match get_reqwest_client()
-        .delete(CONFIG.push_relay_uri() + "/push/" + &uuid)
+    match make_http_request(Method::DELETE, &(CONFIG.push_relay_uri() + "/push/" + &push_id.unwrap()))?
         .header(AUTHORIZATION, auth_header)
         .send()
         .await
@@ -124,51 +148,48 @@ pub async fn unregister_push_device(uuid: String) -> EmptyResult {
 pub async fn push_cipher_update(
     ut: UpdateType,
     cipher: &Cipher,
-    acting_device_uuid: &String,
+    acting_device_id: &DeviceId,
     conn: &mut crate::db::DbConn,
 ) {
     // We shouldn't send a push notification on cipher update if the cipher belongs to an organization, this isn't implemented in the upstream server too.
     if cipher.organization_uuid.is_some() {
         return;
     };
-    let user_uuid = match &cipher.user_uuid {
-        Some(c) => c,
-        None => {
-            debug!("Cipher has no uuid");
-            return;
-        }
+    let Some(user_id) = &cipher.user_uuid else {
+        debug!("Cipher has no uuid");
+        return;
     };
 
-    if Device::check_user_has_push_device(user_uuid, conn).await {
+    if Device::check_user_has_push_device(user_id, conn).await {
         send_to_push_relay(json!({
-            "userId": user_uuid,
+            "userId": user_id,
             "organizationId": (),
-            "deviceId": acting_device_uuid,
-            "identifier": acting_device_uuid,
+            "deviceId": acting_device_id,
+            "identifier": acting_device_id,
             "type": ut as i32,
             "payload": {
-                "id": cipher.uuid,
-                "userId": cipher.user_uuid,
-                "organizationId": (),
-                "revisionDate": cipher.updated_at
+                "Id": cipher.uuid,
+                "UserId": cipher.user_uuid,
+                "OrganizationId": (),
+                "RevisionDate": format_date(&cipher.updated_at)
             }
         }))
         .await;
     }
 }
 
-pub fn push_logout(user: &User, acting_device_uuid: Option<String>) {
-    let acting_device_uuid: Value = acting_device_uuid.map(|v| v.into()).unwrap_or_else(|| Value::Null);
+pub fn push_logout(user: &User, acting_device_id: Option<DeviceId>) {
+    let acting_device_id: Value = acting_device_id.map(|v| v.to_string().into()).unwrap_or_else(|| Value::Null);
 
     tokio::task::spawn(send_to_push_relay(json!({
         "userId": user.uuid,
         "organizationId": (),
-        "deviceId": acting_device_uuid,
-        "identifier": acting_device_uuid,
+        "deviceId": acting_device_id,
+        "identifier": acting_device_id,
         "type": UpdateType::LogOut as i32,
         "payload": {
-            "userId": user.uuid,
-            "date": user.updated_at
+            "UserId": user.uuid,
+            "Date": format_date(&user.updated_at)
         }
     })));
 }
@@ -181,8 +202,8 @@ pub fn push_user_update(ut: UpdateType, user: &User) {
         "identifier": (),
         "type": ut as i32,
         "payload": {
-            "userId": user.uuid,
-            "date": user.updated_at
+            "UserId": user.uuid,
+            "Date": format_date(&user.updated_at)
         }
     })));
 }
@@ -190,38 +211,38 @@ pub fn push_user_update(ut: UpdateType, user: &User) {
 pub async fn push_folder_update(
     ut: UpdateType,
     folder: &Folder,
-    acting_device_uuid: &String,
+    acting_device_id: &DeviceId,
     conn: &mut crate::db::DbConn,
 ) {
     if Device::check_user_has_push_device(&folder.user_uuid, conn).await {
         tokio::task::spawn(send_to_push_relay(json!({
             "userId": folder.user_uuid,
             "organizationId": (),
-            "deviceId": acting_device_uuid,
-            "identifier": acting_device_uuid,
+            "deviceId": acting_device_id,
+            "identifier": acting_device_id,
             "type": ut as i32,
             "payload": {
-                "id": folder.uuid,
-                "userId": folder.user_uuid,
-                "revisionDate": folder.updated_at
+                "Id": folder.uuid,
+                "UserId": folder.user_uuid,
+                "RevisionDate": format_date(&folder.updated_at)
             }
         })));
     }
 }
 
-pub async fn push_send_update(ut: UpdateType, send: &Send, acting_device_uuid: &String, conn: &mut crate::db::DbConn) {
+pub async fn push_send_update(ut: UpdateType, send: &Send, acting_device_id: &DeviceId, conn: &mut crate::db::DbConn) {
     if let Some(s) = &send.user_uuid {
         if Device::check_user_has_push_device(s, conn).await {
             tokio::task::spawn(send_to_push_relay(json!({
                 "userId": send.user_uuid,
                 "organizationId": (),
-                "deviceId": acting_device_uuid,
-                "identifier": acting_device_uuid,
+                "deviceId": acting_device_id,
+                "identifier": acting_device_id,
                 "type": ut as i32,
                 "payload": {
-                    "id": send.uuid,
-                    "userId": send.user_uuid,
-                    "revisionDate": send.revision_date
+                    "Id": send.uuid,
+                    "UserId": send.user_uuid,
+                    "RevisionDate": format_date(&send.revision_date)
                 }
             })));
         }
@@ -243,8 +264,15 @@ async fn send_to_push_relay(notification_data: Value) {
 
     let auth_header = format!("Bearer {}", &auth_push_token);
 
-    if let Err(e) = get_reqwest_client()
-        .post(CONFIG.push_relay_uri() + "/push/send")
+    let req = match make_http_request(Method::POST, &(CONFIG.push_relay_uri() + "/push/send")) {
+        Ok(r) => r,
+        Err(e) => {
+            error!("An error occurred while sending a send update to the push relay: {}", e);
+            return;
+        }
+    };
+
+    if let Err(e) = req
         .header(ACCEPT, "application/json")
         .header(CONTENT_TYPE, "application/json")
         .header(AUTHORIZATION, &auth_header)
@@ -256,38 +284,38 @@ async fn send_to_push_relay(notification_data: Value) {
     };
 }
 
-pub async fn push_auth_request(user_uuid: String, auth_request_uuid: String, conn: &mut crate::db::DbConn) {
-    if Device::check_user_has_push_device(user_uuid.as_str(), conn).await {
+pub async fn push_auth_request(user_id: UserId, auth_request_id: String, conn: &mut crate::db::DbConn) {
+    if Device::check_user_has_push_device(&user_id, conn).await {
         tokio::task::spawn(send_to_push_relay(json!({
-            "userId": user_uuid,
+            "userId": user_id,
             "organizationId": (),
             "deviceId": null,
             "identifier": null,
             "type": UpdateType::AuthRequest as i32,
             "payload": {
-                "id": auth_request_uuid,
-                "userId": user_uuid,
+                "Id": auth_request_id,
+                "UserId": user_id,
             }
         })));
     }
 }
 
 pub async fn push_auth_response(
-    user_uuid: String,
-    auth_request_uuid: String,
-    approving_device_uuid: String,
+    user_id: &UserId,
+    auth_request_id: &AuthRequestId,
+    approving_device_id: &DeviceId,
     conn: &mut crate::db::DbConn,
 ) {
-    if Device::check_user_has_push_device(user_uuid.as_str(), conn).await {
+    if Device::check_user_has_push_device(user_id, conn).await {
         tokio::task::spawn(send_to_push_relay(json!({
-            "userId": user_uuid,
+            "userId": user_id,
             "organizationId": (),
-            "deviceId": approving_device_uuid,
-            "identifier": approving_device_uuid,
+            "deviceId": approving_device_id,
+            "identifier": approving_device_id,
             "type": UpdateType::AuthRequestResponse as i32,
             "payload": {
-                "id": auth_request_uuid,
-                "userId": user_uuid,
+                "Id": auth_request_id,
+                "UserId": user_id,
             }
         })));
     }
